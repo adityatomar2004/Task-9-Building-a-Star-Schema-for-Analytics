@@ -1,0 +1,194 @@
+import pandas as pd
+import sqlite3
+import os
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+dataset_filename = 'Superstore.csv' # Replace if your file name is different
+db_filename = 'task9_warehouse.db'
+
+# ==========================================
+# 1. Load Data
+# ==========================================
+if not os.path.exists(dataset_filename):
+    print(f"ERROR: '{dataset_filename}' not found. Please download the Superstore dataset.")
+    exit()
+
+print("Loading raw dataset...")
+# Try different encodings as Superstore often has special characters
+try:
+    df = pd.read_csv(dataset_filename, encoding='windows-1252')
+except:
+    df = pd.read_csv(dataset_filename, encoding='utf-8')
+
+# Standardize column names for easier SQL handling
+df.columns = [c.replace(' ', '_').replace('-', '_').replace('/', '_') for c in df.columns]
+print(f"Raw Data Loaded: {df.shape}")
+
+# ==========================================
+# 2. Data Modeling - Prepare Dimensions
+# ==========================================
+print("\nModeling Dimensions...")
+
+# --- Dimension: Customer ---
+# Extract unique customer details
+dim_customer = df[['Customer_ID', 'Customer_Name', 'Segment']].drop_duplicates(subset=['Customer_ID'])
+dim_customer = dim_customer.rename(columns={'Customer_ID': 'customer_id', 'Customer_Name': 'customer_name', 'Segment': 'segment'})
+
+# --- Dimension: Product ---
+# Extract unique product details
+dim_product = df[['Product_ID', 'Category', 'Sub_Category', 'Product_Name']].drop_duplicates(subset=['Product_ID'])
+dim_product = dim_product.rename(columns={'Product_ID': 'product_id', 'Category': 'category', 'Sub_Category': 'sub_category', 'Product_Name': 'product_name'})
+
+# --- Dimension: Location ---
+# Extract unique locations. We need to create a surrogate key (Location_ID) since there isn't one.
+dim_location = df[['Country', 'City', 'State', 'Postal_Code', 'Region']].drop_duplicates()
+dim_location['location_id'] = range(1, len(dim_location) + 1) # Create Surrogate Key
+# Merge this new ID back to the main df for the Fact table later
+df = pd.merge(df, dim_location, on=['Country', 'City', 'State', 'Postal_Code', 'Region'], how='left')
+
+# --- Dimension: Date ---
+# Extract unique Order Dates and derive attributes
+date_col = 'Order_Date'
+# Convert to datetime if it's not already
+df[date_col] = pd.to_datetime(df[date_col], errors='coerce') 
+
+dim_date = pd.DataFrame(df[date_col].unique(), columns=['order_date'])
+dim_date['year'] = dim_date['order_date'].dt.year
+dim_date['month'] = dim_date['order_date'].dt.month
+dim_date['quarter'] = dim_date['order_date'].dt.quarter
+dim_date['day_of_week'] = dim_date['order_date'].dt.day_name()
+# Convert date to string for SQL compatibility if needed, or keep as is
+dim_date['date_id'] = dim_date['order_date'].dt.strftime('%Y%m%d') # Surrogate Key style YYYYMMDD
+
+# ==========================================
+# 3. Data Modeling - Prepare Fact Table
+# ==========================================
+print("Modeling Fact Table...")
+
+# We map the main dataframe to our dimension keys
+# Ensure Order_Date maps to our date_id
+df['date_id'] = df['Order_Date'].dt.strftime('%Y%m%d')
+
+# Select only keys and measures
+fact_sales = df[['Order_ID', 'date_id', 'Customer_ID', 'Product_ID', 'location_id', 'Sales', 'Quantity', 'Discount', 'Profit']]
+fact_sales = fact_sales.rename(columns={
+    'Order_ID': 'order_id',
+    'Customer_ID': 'customer_id',
+    'Product_ID': 'product_id',
+    'Sales': 'sales_amount',
+    'Quantity': 'quantity',
+    'Discount': 'discount',
+    'Profit': 'profit'
+})
+
+# ==========================================
+# 4. Create SQL Schema & Insert Data
+# ==========================================
+print(f"\nCreating Database: {db_filename}")
+conn = sqlite3.connect(db_filename)
+cursor = conn.cursor()
+
+# --- Create Tables (SQL DDL) ---
+# Dim_Customer
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS Dim_Customer (
+    customer_id TEXT PRIMARY KEY,
+    customer_name TEXT,
+    segment TEXT
+)
+''')
+
+# Dim_Product
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS Dim_Product (
+    product_id TEXT PRIMARY KEY,
+    category TEXT,
+    sub_category TEXT,
+    product_name TEXT
+)
+''')
+
+# Dim_Location
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS Dim_Location (
+    location_id INTEGER PRIMARY KEY,
+    country TEXT,
+    city TEXT,
+    state TEXT,
+    region TEXT,
+    postal_code TEXT
+)
+''')
+
+# Dim_Date
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS Dim_Date (
+    date_id TEXT PRIMARY KEY,
+    order_date DATE,
+    year INTEGER,
+    month INTEGER,
+    quarter INTEGER,
+    day_of_week TEXT
+)
+''')
+
+# Fact_Sales
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS Fact_Sales (
+    row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id TEXT,
+    date_id TEXT,
+    customer_id TEXT,
+    product_id TEXT,
+    location_id INTEGER,
+    sales_amount REAL,
+    quantity INTEGER,
+    discount REAL,
+    profit REAL,
+    FOREIGN KEY(date_id) REFERENCES Dim_Date(date_id),
+    FOREIGN KEY(customer_id) REFERENCES Dim_Customer(customer_id),
+    FOREIGN KEY(product_id) REFERENCES Dim_Product(product_id),
+    FOREIGN KEY(location_id) REFERENCES Dim_Location(location_id)
+)
+''')
+
+# --- Insert Data ---
+print("Inserting data into SQL tables...")
+dim_customer.to_sql('Dim_Customer', conn, if_exists='replace', index=False)
+dim_product.to_sql('Dim_Product', conn, if_exists='replace', index=False)
+dim_location.to_sql('Dim_Location', conn, if_exists='replace', index=False)
+dim_date.to_sql('Dim_Date', conn, if_exists='replace', index=False)
+fact_sales.to_sql('Fact_Sales', conn, if_exists='replace', index=False)
+
+print("Data insertion complete.")
+
+# ==========================================
+# 5. Validate / Analytics Query
+# ==========================================
+print("\n--- Validation Query: Top 5 Products by Sales (Joining Fact + Dim) ---")
+query = '''
+SELECT 
+    p.product_name,
+    SUM(f.sales_amount) as total_sales
+FROM Fact_Sales f
+JOIN Dim_Product p ON f.product_id = p.product_id
+GROUP BY p.product_name
+ORDER BY total_sales DESC
+LIMIT 5;
+'''
+
+try:
+    results = pd.read_sql_query(query, conn)
+    print(results)
+    
+    # Export results for deliverables
+    results.to_csv('analysis_outputs.csv', index=False)
+    print("\nAnalysis saved to 'analysis_outputs.csv'")
+except Exception as e:
+    print(f"Query Error: {e}")
+
+# Close connection
+conn.close()
+print("\nTask 9 Complete. SQL Schema created in 'task9_warehouse.db'")
